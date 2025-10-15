@@ -12,19 +12,19 @@ import yt_dlp
 from yt_dlp.utils import DownloadError
 from dotenv import load_dotenv
 
-# -------- Загрузка .env --------
+# ---------- .env ----------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my-secret-path")
 BASE_DIR = Path("/tmp")  # временная директория на Render
-MAX_SEND_BYTES = 48 * 1024 * 1024  # ~48 МБ безопасный порог отправки
-YT_COOKIES = os.getenv("YT_COOKIES")  # путь к cookies.txt (секретный файл или в проекте)
+MAX_SEND_BYTES = 48 * 1024 * 1024  # ~48 МБ
+YT_COOKIES = os.getenv("YT_COOKIES")  # путь к cookies.txt (секретный файл или рядом с кодом)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
-# -------- Настройки ffmpeg (для MP3) --------
+# ---------- ffmpeg (для MP3) ----------
 FFMPEG_PATH: Optional[str] = None
 try:
     import imageio_ffmpeg
@@ -32,7 +32,7 @@ try:
 except Exception:
     FFMPEG_PATH = None
 
-# -------- Бот и роутер --------
+# ---------- Bot ----------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
@@ -53,48 +53,59 @@ HELP_TEXT = (
 async def start(m: Message):
     await m.answer(HELP_TEXT)
 
+# ---------- yt-dlp опции ----------
 def _cookies_path() -> Optional[Path]:
-    """Вернёт Path к cookies.txt, если YT_COOKIES задан и файл существует."""
     if not YT_COOKIES:
         return None
     p = Path(YT_COOKIES)
     return p if p.exists() else None
 
 def _base_opts(outtmpl: str) -> dict:
-    """Базовые опции для yt_dlp, с учётом cookies и ffmpeg."""
+    """
+    Базовые опции для yt_dlp:
+    - cookies (если заданы)
+    - ffmpeg
+    - android-клиент (снимает часть ограничений)
+    - geo_bypass
+    """
     opts = {
         "outtmpl": outtmpl,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        # Иногда требуется явный User-Agent
         "http_headers": {
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
             )
         },
+        "geo_bypass": True,
     }
+
     if FFMPEG_PATH:
         opts["ffmpeg_location"] = FFMPEG_PATH
+
     cpath = _cookies_path()
     if cpath:
         opts["cookiefile"] = str(cpath)
-        # 👇 ЛОГ: увидишь путь в Render → Logs
         print(f"Using cookies from {cpath}")
     else:
         print("YT_COOKIES not set or file not found — working without cookies")
+
+    # 👇 ключевой твик: эмулируем Android-клиент YouTube
+    # эквивалент --extractor-args youtube:player_client=android
+    opts.setdefault("extractor_args", {}).setdefault("youtube", {})["player_client"] = ["android"]
+
     return opts
 
 def _extract_info(url: str, download: bool, opts: dict) -> dict:
-    """Вызов yt_dlp с нужными опциями."""
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=download)
 
 async def _send_file_or_link(m: Message, fpath: Path, info: dict, kind: str) -> None:
     """
-    Пытаемся отправить файл. Если он выходит за лимит — даём прямую ссылку (stream URL).
-    kind: 'audio' | 'video' | 'document'
+    Если файл <= лимита — отправляем файл.
+    Иначе — отдаём прямой stream URL (временная ссылка).
     """
     if fpath and fpath.exists() and fpath.stat().st_size <= MAX_SEND_BYTES:
         if kind == "audio":
@@ -117,8 +128,8 @@ async def _send_file_or_link(m: Message, fpath: Path, info: dict, kind: str) -> 
     else:
         await m.answer("Не удалось отправить файл или получить прямую ссылку.")
 
+# ---------- Загрузчики ----------
 async def download_audio_m4a(url: str, dest_dir: Path) -> Tuple[Path, dict]:
-    """Скачиваем лучшую аудиодорожку без перекодирования (обычно .m4a)."""
     outtmpl = str(dest_dir / "%(title).200B.%(ext)s")
     opts = _base_opts(outtmpl)
     opts.update({
@@ -129,7 +140,6 @@ async def download_audio_m4a(url: str, dest_dir: Path) -> Tuple[Path, dict]:
     return fpath, info
 
 async def download_audio_mp3(url: str, dest_dir: Path) -> Tuple[Path, dict]:
-    """Скачиваем и перекодируем в mp3 (нужен ffmpeg)."""
     outtmpl = str(dest_dir / "%(title).200B.%(ext)s")
     opts = _base_opts(outtmpl)
     opts.update({
@@ -146,12 +156,9 @@ async def download_audio_mp3(url: str, dest_dir: Path) -> Tuple[Path, dict]:
     return final, info
 
 async def download_video(url: str, dest_dir: Path) -> Tuple[Path, dict]:
-    """
-    Скачиваем видео с попыткой уложиться в разумный размер.
-    Сначала ищем mp4 ≤720p и <48МБ, далее ≤480p, далее best с ограничением.
-    """
     outtmpl = str(dest_dir / "%(title).200B.%(ext)s")
     opts = _base_opts(outtmpl)
+    # пытаемся ≤720p и/или влезть в лимит; иначе best (может уйти в ссылку)
     opts.update({
         "format": "mp4[height<=720][filesize<48M]/mp4[height<=480]/best[filesize<48M]/best",
     })
@@ -159,12 +166,11 @@ async def download_video(url: str, dest_dir: Path) -> Tuple[Path, dict]:
     fpath = Path(yt_dlp.YoutubeDL(opts).prepare_filename(info))
     return fpath, info
 
-# ----------------- Обработка ошибок -----------------
-
+# ---------- Обработка ошибок ----------
 async def _handle_download_error(m: Message, e: Exception) -> None:
     text = str(e)
 
-    # Спец-случай: YouTube требует вход/подтверждение
+    # Требуется вход / подтверждение
     if isinstance(e, DownloadError) and (
         "Sign in to confirm" in text
         or "This video is age-restricted" in text
@@ -193,8 +199,7 @@ async def _handle_download_error(m: Message, e: Exception) -> None:
 
     await m.answer(f"Ошибка: {e}")
 
-# ----------------- Хэндлеры бота -----------------
-
+# ---------- Хэндлеры ----------
 @router.message(F.text.regexp(YOUTUBE_RX))
 async def on_plain_link(m: Message):
     url = m.text.strip()
@@ -246,8 +251,7 @@ async def cmd_video(m: Message):
     except Exception as e:
         await _handle_download_error(m, e)
 
-# ----------------- FastAPI (webhook) -----------------
-
+# ---------- FastAPI ----------
 app = FastAPI()
 
 @app.post(f"/webhook/{WEBHOOK_SECRET}")
