@@ -1,0 +1,5 @@
+aiogram==3.13.1
+fastapi==0.115.0
+uvicorn==0.30.6
+yt-dlp==2025.01.12
+imageio-ffmpeg==0.4.9  # даст статический ffmpeg для mp3-конвертации (опционально)
